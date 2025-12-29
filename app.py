@@ -1,7 +1,6 @@
 from flask import Flask, render_template, request
 import os
 import re
-import numpy as np
 
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.svm import SVC
