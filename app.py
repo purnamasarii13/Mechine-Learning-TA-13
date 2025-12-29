@@ -2,7 +2,7 @@ from flask import Flask, render_template, request
 import os
 import re
 import numpy as np
-import pandas as pd
+import pandas as pd  # masih dipakai (opsional untuk halaman/cek dataset)
 
 from Sastrawi.StopWordRemover.StopWordRemoverFactory import StopWordRemoverFactory
 from Sastrawi.Stemmer.StemmerFactory import StemmerFactory
@@ -13,7 +13,7 @@ from Sastrawi.Stemmer.StemmerFactory import StemmerFactory
 app = Flask(__name__)
 
 # =========================
-# PATH AMAN (UNTUK LOCAL & VERCEL)
+# PATH (OPSIONAL) - DATASET
 # =========================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_PATH = os.path.join(
@@ -36,6 +36,7 @@ def basic_clean(text: str) -> str:
     text = str(text).lower()
     text = re.sub(r"http\S+|www\.\S+", " ", text)
     text = re.sub(r"[@#]\w+", " ", text)
+    # hilangkan emoji/karakter non-ascii
     text = text.encode("ascii", "ignore").decode("ascii")
     text = re.sub(r"[^a-zA-Z\s]", " ", text)
     text = re.sub(r"\s+", " ", text).strip()
@@ -48,7 +49,7 @@ def preprocess(text: str) -> str:
     return stemmer.stem(text)
 
 # =========================
-# WEAK LABELING / LEXICON
+# LEXICON (RULE-BASED)
 # =========================
 positive_words = {
     "bagus","mantap","keren","hebat","senang","setuju","suka","baik","top","lucu",
@@ -61,16 +62,18 @@ negative_words = {
     "kecewa","jahat","ngawur","bodoh","payah","menyebalkan","tolol","ribet"
 }
 
-def lexicon_score(cleaned_text: str):
+def lexicon_predict(cleaned_text: str):
     """
-    Return: (pred_label, prob_neg, prob_pos, pos_count, neg_count)
-    Probabilitas di sini adalah skor sederhana berbasis rasio count (dengan smoothing).
+    Return:
+      pred (0/1),
+      prob_neg, prob_pos (0..1),
+      pos_count, neg_count
     """
     tokens = cleaned_text.split()
     pos = sum(t in positive_words for t in tokens)
     neg = sum(t in negative_words for t in tokens)
 
-    # smoothing supaya tidak 0/0 dan tetap ada confidence
+    # smoothing supaya tidak 0/0 (juga bikin confidence tetap ada)
     pos_s = pos + 1
     neg_s = neg + 1
     total = pos_s + neg_s
@@ -79,21 +82,35 @@ def lexicon_score(cleaned_text: str):
     prob_neg = neg_s / total
 
     pred = 1 if prob_pos >= prob_neg else 0
-    return pred, float(prob_neg), float(prob_pos), pos, neg
+    return pred, float(prob_neg), float(prob_pos), int(pos), int(neg)
 
 # =========================
-# (OPSIONAL) LOAD DATASET
+# OPSIONAL: LOAD DATASET (TIDAK WAJIB)
 # =========================
-# Kamu masih boleh load dataset untuk validasi/cek kolom,
-# tapi aplikasi prediksi tidak butuh training lagi.
-if os.path.exists(DATA_PATH):
+# Supaya aman untuk Vercel + .vercelignore *.csv,
+# aplikasi TIDAK perlu memuat CSV untuk prediksi manual.
+# Kalau kamu mau tetap load saat LOCAL, gunakan flag env.
+
+LOAD_DATASET = os.getenv("LOAD_DATASET", "0") == "1"
+df = None
+if LOAD_DATASET:
+    if not os.path.exists(DATA_PATH):
+        raise FileNotFoundError("Dataset CSV tidak ditemukan! Matikan LOAD_DATASET atau pastikan file ada.")
     df = pd.read_csv(DATA_PATH)
     if RAW_TEXT_COL not in df.columns:
         raise ValueError("Kolom 'text' tidak ditemukan pada dataset!")
-else:
-    # Tidak wajib untuk prediksi manual, tapi kalau file memang harus ada, aktifkan ini:
-    # raise FileNotFoundError("Dataset CSV tidak ditemukan!")
-    df = None
+    df[TEXT_COL] = df[RAW_TEXT_COL].fillna("").apply(preprocess)
+    # weak label (opsional) jika kamu butuh analisis dataset
+    def weak_label(cleaned: str):
+        tokens = cleaned.split()
+        pos = sum(t in positive_words for t in tokens)
+        neg = sum(t in negative_words for t in tokens)
+        if pos > neg:
+            return 1
+        elif neg > pos:
+            return 0
+        return None
+    df[LABEL_NUM_COL] = df[TEXT_COL].apply(weak_label)
 
 # =========================
 # ROUTES
@@ -103,7 +120,7 @@ def home():
     return render_template(
         "index.html",
         filled_text="",
-        selected_model="lexicon",   # ganti label UI kalau perlu
+        selected_model="lexicon",
         selected_mode="simple",
         prediction_text=None,
         proba_text=None,
@@ -117,8 +134,7 @@ def home():
 def predict():
     try:
         text = request.form.get("text", "").strip()
-        # model_choice tetap ditangkap supaya HTML kamu tidak rusak
-        model_choice = request.form.get("model", "lexicon")
+        model_choice = request.form.get("model", "lexicon")  # tetap diterima dari form
         mode = request.form.get("mode", "simple")
 
         if not text:
@@ -126,7 +142,7 @@ def predict():
 
         cleaned = preprocess(text)
 
-        pred, prob_neg, prob_pos, pos_count, neg_count = lexicon_score(cleaned)
+        pred, prob_neg, prob_pos, pos_count, neg_count = lexicon_predict(cleaned)
         confidence = max(prob_neg, prob_pos) * 100
 
         model_name = "Lexicon Rule-Based"
@@ -173,8 +189,5 @@ def predict():
             error_text=str(e)
         )
 
-# =========================
-# RUN LOCAL
-# =========================
 if __name__ == "__main__":
     app.run(debug=True)
