@@ -1,9 +1,8 @@
 from flask import Flask, render_template, request
 import os
 import re
-
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.svm import SVC
+import numpy as np
+import pandas as pd
 
 from Sastrawi.StopWordRemover.StopWordRemoverFactory import StopWordRemoverFactory
 from Sastrawi.Stemmer.StemmerFactory import StemmerFactory
@@ -49,7 +48,7 @@ def preprocess(text: str) -> str:
     return stemmer.stem(text)
 
 # =========================
-# WEAK LABELING
+# WEAK LABELING / LEXICON
 # =========================
 positive_words = {
     "bagus","mantap","keren","hebat","senang","setuju","suka","baik","top","lucu",
@@ -62,53 +61,39 @@ negative_words = {
     "kecewa","jahat","ngawur","bodoh","payah","menyebalkan","tolol","ribet"
 }
 
-def weak_label(text: str):
-    tokens = text.split()
+def lexicon_score(cleaned_text: str):
+    """
+    Return: (pred_label, prob_neg, prob_pos, pos_count, neg_count)
+    Probabilitas di sini adalah skor sederhana berbasis rasio count (dengan smoothing).
+    """
+    tokens = cleaned_text.split()
     pos = sum(t in positive_words for t in tokens)
     neg = sum(t in negative_words for t in tokens)
 
-    if pos > neg:
-        return 1
-    elif neg > pos:
-        return 0
-    else:
-        return None
+    # smoothing supaya tidak 0/0 dan tetap ada confidence
+    pos_s = pos + 1
+    neg_s = neg + 1
+    total = pos_s + neg_s
+
+    prob_pos = pos_s / total
+    prob_neg = neg_s / total
+
+    pred = 1 if prob_pos >= prob_neg else 0
+    return pred, float(prob_neg), float(prob_pos), pos, neg
 
 # =========================
-# LOAD DATA & TRAIN MODEL
+# (OPSIONAL) LOAD DATASET
 # =========================
-if not os.path.exists(DATA_PATH):
-    raise FileNotFoundError("Dataset CSV tidak ditemukan!")
-
-df = pd.read_csv(DATA_PATH)
-
-if RAW_TEXT_COL not in df.columns:
-    raise ValueError("Kolom 'text' tidak ditemukan pada dataset!")
-
-# Preprocess
-df[TEXT_COL] = df[RAW_TEXT_COL].fillna("").apply(preprocess)
-
-# Weak labeling
-df[LABEL_NUM_COL] = df[TEXT_COL].apply(weak_label)
-
-# Buang data netral
-df_lab = df.dropna(subset=[LABEL_NUM_COL]).copy()
-df_lab[LABEL_NUM_COL] = df_lab[LABEL_NUM_COL].astype(int)
-
-if df_lab.empty:
-    raise ValueError("Data berlabel kosong. Periksa kamus kata!")
-
-# TF-IDF
-vectorizer = TfidfVectorizer()
-X_all = vectorizer.fit_transform(df_lab[TEXT_COL])
-y_all = df_lab[LABEL_NUM_COL].values
-
-# Train SVM
-svm_linear = SVC(kernel="linear", probability=True)
-svm_rbf = SVC(kernel="rbf", gamma="scale", probability=True)
-
-svm_linear.fit(X_all, y_all)
-svm_rbf.fit(X_all, y_all)
+# Kamu masih boleh load dataset untuk validasi/cek kolom,
+# tapi aplikasi prediksi tidak butuh training lagi.
+if os.path.exists(DATA_PATH):
+    df = pd.read_csv(DATA_PATH)
+    if RAW_TEXT_COL not in df.columns:
+        raise ValueError("Kolom 'text' tidak ditemukan pada dataset!")
+else:
+    # Tidak wajib untuk prediksi manual, tapi kalau file memang harus ada, aktifkan ini:
+    # raise FileNotFoundError("Dataset CSV tidak ditemukan!")
+    df = None
 
 # =========================
 # ROUTES
@@ -118,7 +103,7 @@ def home():
     return render_template(
         "index.html",
         filled_text="",
-        selected_model="linear",
+        selected_model="lexicon",   # ganti label UI kalau perlu
         selected_mode="simple",
         prediction_text=None,
         proba_text=None,
@@ -132,28 +117,19 @@ def home():
 def predict():
     try:
         text = request.form.get("text", "").strip()
-        model_choice = request.form.get("model", "linear")
+        # model_choice tetap ditangkap supaya HTML kamu tidak rusak
+        model_choice = request.form.get("model", "lexicon")
         mode = request.form.get("mode", "simple")
 
         if not text:
             raise ValueError("Komentar TikTok tidak boleh kosong.")
 
         cleaned = preprocess(text)
-        X_input = vectorizer.transform([cleaned])
 
-        if model_choice == "rbf":
-            model = svm_rbf
-            model_name = "SVM RBF"
-        else:
-            model = svm_linear
-            model_name = "SVM Linear"
-
-        pred = int(model.predict(X_input)[0])
-        probs = model.predict_proba(X_input)[0]
-
-        prob_neg = float(probs[0])
-        prob_pos = float(probs[1])
+        pred, prob_neg, prob_pos, pos_count, neg_count = lexicon_score(cleaned)
         confidence = max(prob_neg, prob_pos) * 100
+
+        model_name = "Lexicon Rule-Based"
 
         if pred == 1:
             result_html = f"✅ Sentimen <b>POSITIF (1)</b> — Model: <b>{model_name}</b>"
@@ -163,10 +139,10 @@ def predict():
         proba_text = (
             f"P(Negatif)={prob_neg:.4f} | "
             f"P(Positif)={prob_pos:.4f} | "
-            f"Keyakinan: {confidence:.2f}%"
+            f"Keyakinan: {confidence:.2f}% | "
+            f"Hitung Kata: pos={pos_count}, neg={neg_count}"
         )
 
-        # 🔑 INI PENTING → grafik muncul
         labels = ["Negatif (0)", "Positif (1)"]
         values = [prob_neg, prob_pos]
 
@@ -187,7 +163,7 @@ def predict():
         return render_template(
             "index.html",
             filled_text=request.form.get("text", ""),
-            selected_model=request.form.get("model", "linear"),
+            selected_model=request.form.get("model", "lexicon"),
             selected_mode=request.form.get("mode", "simple"),
             prediction_text=None,
             proba_text=None,
